@@ -809,8 +809,9 @@ class ResourceFetcher:
 
         tls_crt = data.get('tls.crt', None)
         tls_key = data.get('tls.key', None)
+        user_key = data.get('user.key', None)
 
-        if not tls_crt and not tls_key:
+        if not tls_crt and not tls_key and not user_key:
             # Uh. WTFO?
             self.logger.debug(f'ignoring K8s Secret {resource_identifier} with no keys')
             return None
@@ -822,14 +823,17 @@ class ResourceFetcher:
             'ambassador_id': Config.ambassador_id,
             'kind': 'Secret',
             'name': resource_name,
-            'namespace': resource_namespace
+            'namespace': resource_namespace,
+            'secret_type': secret_type
         }
 
-        if tls_crt:
-            secret_info['tls_crt'] = tls_crt
+        secret_info.update(data)
 
-        if tls_key:
-            secret_info['tls_key'] = tls_key
+        # if tls_crt:
+        #     secret_info['tls_crt'] = tls_crt
+        #
+        # if tls_key:
+        #     secret_info['tls_key'] = tls_key
 
         return resource_identifier, [ secret_info ]
 

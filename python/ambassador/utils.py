@@ -243,10 +243,11 @@ class PeriodicTrigger(threading.Thread):
 
 
 class SecretInfo:
-    def __init__(self, name: str, namespace: str,
+    def __init__(self, name: str, namespace: str, secret_type: str,
                  tls_crt: Optional[str], tls_key: Optional[str]=None, decode_b64=True) -> None:
         self.name = name
         self.namespace = namespace
+        self.secret_type = secret_type
 
         if decode_b64:
             if tls_crt and not tls_crt.startswith('-----BEGIN'):
@@ -292,6 +293,7 @@ class SecretInfo:
         return {
             'name': self.name,
             'namespace': self.namespace,
+            'secret_type': self.secret_type,
             'tls_crt': self.fingerprint(self.tls_crt),
             'tls_key': self.fingerprint(self.tls_key)
         }
@@ -301,6 +303,7 @@ class SecretInfo:
         return SecretInfo(
             aconf_object.name,
             aconf_object.namespace,
+            aconf_object.secret_type,
             aconf_object.tls_crt,
             aconf_object.get('tls_key', None)
         )
@@ -308,23 +311,33 @@ class SecretInfo:
     @classmethod
     def from_dict(cls, resource: 'IRResource',
                   secret_name: str, namespace: str, source: str,
-                  cert_data: Optional[Dict[str, Any]]) -> Optional['SecretInfo']:
+                  cert_data: Optional[Dict[str, Any]], secret_type="kubernetes.io/tls") -> Optional['SecretInfo']:
         if not cert_data:
             resource.ir.logger.error(f"{resource.kind} {resource.name}: found no certificate in {source}?")
             return None
 
-        # OK, we have something to work with. Hopefully.
-        cert = cert_data.get('tls.crt', None)
+        if secret_type == 'kubernetes.io/tls':
+            # OK, we have something to work with. Hopefully.
+            cert = cert_data.get('tls.crt', None)
 
-        if not cert:
-            # Having no public half is definitely an error. Having no private half given a public half
-            # might be OK, though -- that's up to our caller to decide.
-            resource.ir.logger.error(f"{resource.kind} {resource.name}: found data but no certificate in {source}?")
-            return None
+            if not cert:
+                # Having no public half is definitely an error. Having no private half given a public half
+                # might be OK, though -- that's up to our caller to decide.
+                resource.ir.logger.error(f"{resource.kind} {resource.name}: found data but no certificate in {source}?")
+                return None
 
-        key = cert_data.get('tls.key', None)
+            key = cert_data.get('tls.key', None)
+        elif secret_type == 'Opaque':
+            key = cert_data.get('user.key', None)
 
-        return SecretInfo(secret_name, namespace, cert, key)
+            if not key:
+                # The opaque keys we support must have user.key, but will likely have nothing else.
+                resource.ir.logger.error(f"{resource.kind} {resource.name}: found data but no user.key in {source}?")
+                return None
+
+            cert = None
+
+        return SecretInfo(secret_name, namespace, secret_type, cert, key)
 
 
 class SavedSecret:
@@ -435,6 +448,7 @@ class SecretHandler:
             # Nothing in the serialization, we're done.
             return None
 
+        secret_type = None
         cert_data = None
         ocount = 0
         errors = 0
@@ -457,6 +471,8 @@ class SecretHandler:
                 errors += 1
                 continue
 
+            secret_type = metadata.get('type', 'kubernetes.io/tls')
+
             if 'data' in obj:
                 if cert_data:
                     self.logger.error("%s %s: found multiple Secrets in %s?" %
@@ -470,7 +486,8 @@ class SecretHandler:
             # Bzzt.
             return None
 
-        return SecretInfo.from_dict(resource, secret_name, source, namespace, cert_data)
+        return SecretInfo.from_dict(resource, secret_name, namespace, source,
+                                    cert_data=cert_data, secret_type=secret_type)
 
 
 class NullSecretHandler(SecretHandler):
@@ -498,7 +515,7 @@ class NullSecretHandler(SecretHandler):
         self.logger.debug("NullSecretHandler (%s %s): load secret %s in namespace %s" %
                           (resource.kind, resource.name, secret_name, namespace))
 
-        return SecretInfo(secret_name, namespace, "fake-tls-crt", "fake-tls-key")
+        return SecretInfo(secret_name, namespace, "fake-secret", "fake-tls-crt", "fake-tls-key")
 
 
 class FSSecretHandler(SecretHandler):
@@ -541,9 +558,11 @@ class FSSecretHandler(SecretHandler):
         version = obj.get('apiVersion', None)
         kind = obj.get('kind', None)
 
-        if version.startswith('ambassador') and (kind == 'Secret'):
+        if (kind == 'Secret') and (version.startswith('ambassador') or version.startswith('getambassador.io')):
             # It's an Ambassador Secret. It should have a public key and maybe a private key.
-            return SecretInfo.from_dict(resource, secret_name, namespace, source, obj)
+            secret_type = obj.get('type', 'kubernetes.io/tls')
+            return SecretInfo.from_dict(resource, secret_name, namespace, source,
+                                        cert_data=obj, secret_type=secret_type)
 
         # Didn't look like an Ambassador object. Try K8s.
         return self.secret_info_from_k8s(resource, secret_name, namespace, source, serialization)
