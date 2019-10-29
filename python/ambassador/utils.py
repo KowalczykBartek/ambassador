@@ -244,7 +244,8 @@ class PeriodicTrigger(threading.Thread):
 
 class SecretInfo:
     def __init__(self, name: str, namespace: str, secret_type: str,
-                 tls_crt: Optional[str], tls_key: Optional[str]=None, decode_b64=True) -> None:
+                 tls_crt: Optional[str], tls_key: Optional[str]=None, user_key: Optional[str]=None,
+                 decode_b64=True) -> None:
         self.name = name
         self.namespace = namespace
         self.secret_type = secret_type
@@ -256,8 +257,12 @@ class SecretInfo:
             if tls_key and not tls_key.startswith('-----BEGIN'):
                 tls_key = self.decode(tls_key)
 
+            if user_key and not user_key.startswith('-----BEGIN'):
+                user_key = self.decode(user_key)
+
         self.tls_crt = tls_crt
         self.tls_key = tls_key
+        self.user_key = user_key
 
     @staticmethod
     def decode(b64_pem: str) -> Optional[str]:
@@ -295,7 +300,8 @@ class SecretInfo:
             'namespace': self.namespace,
             'secret_type': self.secret_type,
             'tls_crt': self.fingerprint(self.tls_crt),
-            'tls_key': self.fingerprint(self.tls_key)
+            'tls_key': self.fingerprint(self.tls_key),
+            'user_key': self.fingerprint(self.user_key)
         }
 
     @classmethod
@@ -305,48 +311,56 @@ class SecretInfo:
             aconf_object.namespace,
             aconf_object.secret_type,
             aconf_object.tls_crt,
-            aconf_object.get('tls_key', None)
+            aconf_object.get('tls_key', None),
+            aconf_object.get('user_key', None)
         )
 
     @classmethod
     def from_dict(cls, resource: 'IRResource',
                   secret_name: str, namespace: str, source: str,
                   cert_data: Optional[Dict[str, Any]], secret_type="kubernetes.io/tls") -> Optional['SecretInfo']:
+
+        tls_crt = None
+        tls_key = None
+        user_key = None
+
         if not cert_data:
             resource.ir.logger.error(f"{resource.kind} {resource.name}: found no certificate in {source}?")
             return None
 
         if secret_type == 'kubernetes.io/tls':
             # OK, we have something to work with. Hopefully.
-            cert = cert_data.get('tls.crt', None)
+            tls_crt = cert_data.get('tls.crt', None)
 
-            if not cert:
+            if not tls_crt:
                 # Having no public half is definitely an error. Having no private half given a public half
                 # might be OK, though -- that's up to our caller to decide.
                 resource.ir.logger.error(f"{resource.kind} {resource.name}: found data but no certificate in {source}?")
                 return None
 
-            key = cert_data.get('tls.key', None)
+            tls_key = cert_data.get('tls.key', None)
         elif secret_type == 'Opaque':
-            key = cert_data.get('user.key', None)
+            user_key = cert_data.get('user.key', None)
 
-            if not key:
+            if not user_key:
                 # The opaque keys we support must have user.key, but will likely have nothing else.
                 resource.ir.logger.error(f"{resource.kind} {resource.name}: found data but no user.key in {source}?")
                 return None
 
             cert = None
 
-        return SecretInfo(secret_name, namespace, secret_type, cert, key)
+        return SecretInfo(secret_name, namespace, secret_type, tls_crt=tls_crt, tls_key=tls_key, user_key=user_key)
 
 
 class SavedSecret:
     def __init__(self, secret_name: str, namespace: str,
-                 cert_path: Optional[str], key_path: Optional[str], cert_data: Optional[Dict]) -> None:
+                 cert_path: Optional[str], key_path: Optional[str], user_path: Optional[str],
+                 cert_data: Optional[Dict]) -> None:
         self.secret_name = secret_name
         self.namespace = namespace
         self.cert_path = cert_path
         self.key_path = key_path
+        self.user_path = user_path
         self.cert_data = cert_data
 
     @property
@@ -354,11 +368,11 @@ class SavedSecret:
         return "secret %s in namespace %s" % (self.secret_name, self.namespace)
 
     def __bool__(self) -> bool:
-        return bool(bool(self.cert_path) and (self.cert_data is not None))
+        return bool((bool(self.cert_path) or bool(self.user_path)) and (self.cert_data is not None))
 
     def __str__(self) -> str:
-        return "<SavedSecret %s.%s -- cert_path %s, key_path %s, cert_data %s>" % (
-                  self.secret_name, self.namespace, self.cert_path, self.key_path,
+        return "<SavedSecret %s.%s -- cert_path %s, key_path %s, user_path %s, cert_data %s>" % (
+                  self.secret_name, self.namespace, self.cert_path, self.key_path, self.user_path,
                   "present" if self.cert_data else "absent"
                 )
 
@@ -389,20 +403,22 @@ class SecretHandler:
     def cache_secret(self, resource: 'IRResource', secret_info: SecretInfo) -> SavedSecret:
         name = secret_info.name
         namespace = secret_info.namespace
-        cert = secret_info.tls_crt
-        key = secret_info.tls_key
+        tls_crt = secret_info.tls_crt
+        tls_key = secret_info.tls_key
+        user_key = secret_info.user_key
 
-        cert_path = None
-        key_path = None
+        tls_crt_path = None
+        tls_key_path = None
+        user_key_path = None
         cert_data = None
 
         h = hashlib.new('sha1')
 
-        if cert:
-            h.update(cert.encode('utf-8'))
-
-            if key:
-                h.update(key.encode('utf-8'))
+        # Don't save if it has neither a tls_crt or a user_key.
+        if tls_crt or user_key:
+            for el in [tls_crt, tls_key, user_key]:
+                if el:
+                    h.update(el.encode('utf-8'))
 
             hd = h.hexdigest().upper()
 
@@ -413,19 +429,25 @@ class SecretHandler:
             except FileExistsError:
                 pass
 
-            cert_path = os.path.join(secret_dir, f'{hd}.crt')
-            open(cert_path, "w").write(cert)
+            if tls_crt:
+                tls_crt_path = os.path.join(secret_dir, f'{hd}.crt')
+                open(tls_crt_path, "w").write(tls_crt)
 
-            if key:
-                key_path = os.path.join(secret_dir, f'{hd}.key')
-                open(key_path, "w").write(key)
+            if tls_key:
+                tls_key_path = os.path.join(secret_dir, f'{hd}.key')
+                open(tls_key_path, "w").write(tls_key)
+
+            if user_key:
+                user_key_path = os.path.join(secret_dir, f'{hd}.user')
+                open(user_key_path, "w").write(user_key)
 
             cert_data = {
-                'tls_crt': cert,
-                'tls_key': key
+                'tls_crt': tls_crt,
+                'tls_key': tls_key,
+                'user_key': user_key,
             }
 
-        return SavedSecret(name, namespace, cert_path, key_path, cert_data)
+        return SavedSecret(name, namespace, tls_crt_path, tls_key_path, user_key_path, cert_data)
 
     # secret_info_from_k8s takes a K8s Secret and returns a SecretInfo (or None if something
     # is wrong).
@@ -515,7 +537,8 @@ class NullSecretHandler(SecretHandler):
         self.logger.debug("NullSecretHandler (%s %s): load secret %s in namespace %s" %
                           (resource.kind, resource.name, secret_name, namespace))
 
-        return SecretInfo(secret_name, namespace, "fake-secret", "fake-tls-crt", "fake-tls-key")
+        return SecretInfo(secret_name, namespace, "fake-secret", "fake-tls-crt", "fake-tls-key", "fake-user-key",
+                          decode_b64=False)
 
 
 class FSSecretHandler(SecretHandler):

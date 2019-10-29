@@ -807,11 +807,14 @@ class ResourceFetcher:
         # This resource identifier is useful for log output since filenames can be duplicated (multiple subdirectories)
         resource_identifier = f'{resource_name}.{resource_namespace}'
 
-        tls_crt = data.get('tls.crt', None)
-        tls_key = data.get('tls.key', None)
-        user_key = data.get('user.key', None)
+        found_any = False
 
-        if not tls_crt and not tls_key and not user_key:
+        for key in [ 'tls.crt', 'tls.key', 'user.key' ]:
+            if data.get(key, None):
+                found_any = True
+                break
+
+        if not found_any:
             # Uh. WTFO?
             self.logger.debug(f'ignoring K8s Secret {resource_identifier} with no keys')
             return None
@@ -827,13 +830,8 @@ class ResourceFetcher:
             'secret_type': secret_type
         }
 
-        secret_info.update(data)
-
-        # if tls_crt:
-        #     secret_info['tls_crt'] = tls_crt
-        #
-        # if tls_key:
-        #     secret_info['tls_key'] = tls_key
+        for key, value in data.items():
+            secret_info[key.replace('.', '_')] = value
 
         return resource_identifier, [ secret_info ]
 

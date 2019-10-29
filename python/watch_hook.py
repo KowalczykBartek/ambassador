@@ -75,8 +75,8 @@ class SecretRecorder(SecretHandler):
 
     # Never cache anything.
     def cache_secret(self, resource: 'IRResource', secret_info: SecretInfo):
-        return SavedSecret(secret_info.name, secret_info.namespace, '-crt-path-', '-key-path-',
-                           { 'tls_crt': '-crt-', 'tls_key': '-key-' })
+        return SavedSecret(secret_info.name, secret_info.namespace, '-crt-path-', '-key-path-', '-user-path-',
+                           { 'tls.crt': '-crt-', 'tls.key': '-key-', 'user.key': '-user-' })
 
 
 # XXX Sooooo there's some ugly stuff here.
