@@ -205,6 +205,11 @@ for mname, mapping in mappings.items():
                 host = svc.hostname
                 namespace = Config.ambassador_namespace
 
+                if not host:
+                    # This is really kind of impossible.
+                    logger.error(f"KubernetesEndpointResolver {res_name} has no 'hostname'")
+                    continue
+
                 if "." in host:
                     (host, namespace) = host.split(".", 2)[0:2]
 
